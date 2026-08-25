@@ -1,58 +1,25 @@
 const fs = require("fs");
 const path = require("path");
 const net = require("net");
-const os = require("os");
 const exec = require("child_process").exec;
 const { shell, dialog, ipcMain, app } = require("electron");
 
 var configFilePath = "";
 var pipePath = null;
 var pluginDataDir = path.join(LiteLoader.path.data, "media_local_view");
-var diagnosticLogPath = path.join(pluginDataDir, "diagnostic.log");
 
-function logProbe(event, details = {}) {
-  try {
-    fs.mkdirSync(pluginDataDir, { recursive: true });
-    fs.appendFileSync(
-      diagnosticLogPath,
-      `[${new Date().toISOString()}] ${event} ${JSON.stringify(details)}\n`,
-      "utf-8"
-    );
-  } catch {}
-}
-
-function inspectMedia(value) {
-  const keys = [];
-  const candidates = [];
-  const seen = new WeakSet();
-
-  function visit(current, currentPath, depth) {
-    if (current == null || depth > 6 || keys.length >= 200) return;
-    if (typeof current === "string") {
-      if (/^(https?|file|appimg):|\.(avif|gif|jpe?g|png|webp)(\?|$)/i.test(current)) {
-        candidates.push({ path: currentPath, value: current });
-      }
-      return;
-    }
-    if (typeof current !== "object" || seen.has(current)) return;
-    seen.add(current);
-
-    for (const key of Object.keys(current)) {
-      const child = current[key];
-      const childPath = `${currentPath}.${key}`;
-      keys.push({ path: childPath, type: Array.isArray(child) ? "array" : typeof child });
-      visit(child, childPath, depth + 1);
-    }
-  }
-
-  visit(value, "$", 0);
-  return { keys, candidates };
-}
-
+// QQNT 9.9.23 的 appimg 头像文件没有扩展名，需要补全后再交给系统查看器。
 function prepareAppImage(originPath) {
   if (typeof originPath !== "string" || !originPath.startsWith("appimg://")) return null;
 
-  const sourcePath = path.normalize(decodeURIComponent(originPath.slice("appimg://".length)));
+  let sourcePath;
+  try {
+    sourcePath = path.normalize(
+      decodeURIComponent(originPath.slice("appimg://".length))
+    );
+  } catch {
+    return null;
+  }
   if (!fs.existsSync(sourcePath)) return null;
   if (path.extname(sourcePath)) return sourcePath;
 
@@ -67,11 +34,18 @@ function prepareAppImage(originPath) {
   let extension = null;
   if (signature[0] === 0xff && signature[1] === 0xd8 && signature[2] === 0xff) {
     extension = ".jpg";
-  } else if (signature.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+  } else if (
+    signature
+      .subarray(0, 8)
+      .equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  ) {
     extension = ".png";
   } else if (signature.subarray(0, 4).toString("ascii") === "GIF8") {
     extension = ".gif";
-  } else if (signature.subarray(0, 4).toString("ascii") === "RIFF" && signature.subarray(8, 12).toString("ascii") === "WEBP") {
+  } else if (
+    signature.subarray(0, 4).toString("ascii") === "RIFF" &&
+    signature.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
     extension = ".webp";
   }
   if (!extension) return null;
@@ -80,11 +54,8 @@ function prepareAppImage(originPath) {
   fs.mkdirSync(cacheDir, { recursive: true });
   const cachePath = path.join(cacheDir, `${path.basename(sourcePath)}${extension}`);
   fs.copyFileSync(sourcePath, cachePath);
-  logProbe("media.avatar-cached", { sourcePath, cachePath });
   return cachePath;
 }
-
-logProbe("module.load", { versions: process.versions });
 
 var sampleConfig = {
   localVideo: true,
@@ -228,13 +199,7 @@ function onLoad() {
 }
 
 var hookedWebContents = new WeakSet();
-var loggedIpcNames = new Set();
 function onBrowserWindowCreated(window) {
-  logProbe("window.created", {
-    id: window.id,
-    url: window.webContents.getURL(),
-  });
-
   window.webContents.on("did-stop-loading", () => {
     const url = window.webContents.getURL();
     //只针对主界面和独立聊天界面生效
@@ -246,92 +211,40 @@ function onBrowserWindowCreated(window) {
     ) {
       if (hookedWebContents.has(window.webContents)) return;
       hookedWebContents.add(window.webContents);
-
-      logProbe("ipc.hook.install", {
-        id: window.id,
-        url,
-        privateListeners: window.webContents.listenerCount("-ipc-message"),
-        publicListeners: window.webContents.listenerCount("ipc-message"),
-      });
-      window.webContents.prependListener("-ipc-message", ipc_message);
       window.webContents.prependListener("ipc-message", ipc_message);
 
-      function ipc_message(_, ...args) {
+      function ipc_message(event, ...args) {
         try {
-          const name = args.find(arg => typeof arg === "string");
-          if (!loggedIpcNames.has(name) && loggedIpcNames.size < 100) {
-            loggedIpcNames.add(name);
-            logProbe("ipc.event", {
-              name,
-              argumentTypes: args.map(arg => Array.isArray(arg) ? "array" : typeof arg),
-            });
+          const mediaViewerObj = args.flat(Infinity).find(item =>
+            item &&
+            typeof item === "object" &&
+            item.cmdName === "openMediaViewer"
+          );
+          const mediaViewerData = mediaViewerObj?.payload?.[0];
+          const mediaList = mediaViewerData?.mediaList;
+          const openedPicIndex = mediaViewerData?.index;
+          if (!mediaList?.length || openedPicIndex >= mediaList.length) return;
+
+          const currentMedia = mediaList[openedPicIndex];
+          const picPath = currentMedia?.context?.sourcePath ||
+            prepareAppImage(currentMedia?.originPath);
+          const videoPath = currentMedia?.context?.video?.path;
+          var handled = false;
+
+          if (picPath != null && nowConfig.localPic == true) {
+            localOpen(picPath);
+            handled = true;
+          } else if (videoPath != null && nowConfig.localVideo == true) {
+            localOpen(videoPath);
+            handled = true;
           }
 
-          if (args != null) {
-            // 扁平化数组并查找 cmdName 为 "openMediaViewer" 的对象
-            var allObjects = args.flat(Infinity).filter(item =>
-              item &&
-              typeof item === "object" &&
-              item.cmdName === "openMediaViewer"
-            );
-
-            if (allObjects.length > 0) {
-              var mediaViewerObj = allObjects[0];
-              logProbe("media.command", {
-                name,
-                payloadType: Array.isArray(mediaViewerObj.payload) ? "array" : typeof mediaViewerObj.payload,
-                payloadLength: mediaViewerObj.payload?.length,
-              });
-
-              if (mediaViewerObj.payload && mediaViewerObj.payload[0]) {
-                var mediaViewerData = mediaViewerObj.payload[0];
-                var mediaList = mediaViewerData.mediaList;
-                var openedPicIndex = mediaViewerData.index;
-
-                if (mediaList != null && mediaList.length > 0 && openedPicIndex < mediaList.length) {
-                  var currentMedia = mediaList[openedPicIndex];
-                  var handled = false;
-
-                  // 处理图片
-                  var picPath = currentMedia?.context?.sourcePath || prepareAppImage(currentMedia?.originPath);
-                  logProbe("media.selected", {
-                    index: openedPicIndex,
-                    mediaCount: mediaList.length,
-                    hasPicPath: picPath != null,
-                    hasVideoPath: currentMedia?.context?.video?.path != null,
-                  });
-                  if (picPath != null && nowConfig.localPic == true) {
-                    logProbe("media.open-picture", { path: picPath });
-                    localOpen(picPath);
-                    handled = true;
-                  }
-
-                  // 处理视频
-                  var videoPath = currentMedia?.context?.video?.path;
-                  if (videoPath != null && nowConfig.localVideo == true) {
-                    logProbe("media.open-video", { path: videoPath });
-                    localOpen(videoPath);
-                    handled = true;
-                  }
-
-                  if (handled) {
-                    if (typeof _?.preventDefault === "function") {
-                      _.preventDefault();
-                    }
-                    mediaViewerObj.cmdName = "";
-                    mediaViewerObj.payload = [];
-                    logProbe("media.command-suppressed", {
-                      defaultPrevented: Boolean(_?.defaultPrevented),
-                    });
-                  } else {
-                    logProbe("media.unresolved", inspectMedia(currentMedia));
-                  }
-                }
-              }
-            }
+          if (handled) {
+            event.preventDefault();
+            mediaViewerObj.cmdName = "";
+            mediaViewerObj.payload = [];
           }
         } catch (e) {
-          logProbe("ipc.error", { message: e.message, stack: e.stack });
           output(
             "NTQQ Image-Local-View Error: ",
             e,
@@ -341,7 +254,6 @@ function onBrowserWindowCreated(window) {
       }
 
       async function localOpen(path) {
-        logProbe("local-open.request", { path, exists: fs.existsSync(path) });
         var openOrPreview = async (path) => {
           if (
             nowConfig.macOSBuiltinPreview == true &&
@@ -355,7 +267,6 @@ function onBrowserWindowCreated(window) {
             await useWindowsQuickLook(path);
           } else {
             var ret = await shell.openPath(path);
-            logProbe("local-open.result", { path, error: ret });
             if (ret != "") {
               dialog.showMessageBox({
                 type: "error",
@@ -378,7 +289,6 @@ function onBrowserWindowCreated(window) {
             }, 100);
           }
         } catch (e) {
-          logProbe("local-open.error", { message: e.message, stack: e.stack });
           output(
             "NTQQ Image-Local-View Error: ",
             e,
@@ -386,10 +296,6 @@ function onBrowserWindowCreated(window) {
           );
         }
       }
-
-      output(
-        "NTQQ Image-Local-View for window: " + window.webContents.getURL()
-      );
     }
   });
 }

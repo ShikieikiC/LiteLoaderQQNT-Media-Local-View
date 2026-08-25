@@ -375,10 +375,6 @@ async function onLoad() {
   var finder = setInterval(() => {
     if (document.querySelector(".ml-list.list")) {
       clearInterval(finder);
-      console.log(
-        "[Media-Local-View]",
-        "检测到聊天区域，已在当前页面加载视频下载辅助"
-      );
       const targetNode = document.querySelector(".ml-list.list");
       const config = {
         attributes: false,
