@@ -8,18 +8,37 @@ var configFilePath = "";
 var pipePath = null;
 var pluginDataDir = path.join(LiteLoader.path.data, "media_local_view");
 
-// QQNT 9.9.23 的 appimg 头像文件没有扩展名，需要补全后再交给系统查看器。
-function prepareAppImage(originPath) {
-  if (typeof originPath !== "string" || !originPath.startsWith("appimg://")) return null;
-
-  let sourcePath;
+// QQNT 9.9.33 的 appimg URL 会把盘符冒号吞掉：
+//   appimg://E/Message Files/... （盘符后是 "/" 而非 ":/"）
+// 早期版本是正常的 appimg://E:/Message Files/...，两种都要兼容。
+function appImageToLocalPath(originPath) {
+  let raw;
   try {
-    sourcePath = path.normalize(
-      decodeURIComponent(originPath.slice("appimg://".length))
-    );
+    raw = decodeURIComponent(originPath.slice("appimg://".length));
   } catch {
     return null;
   }
+
+  // 补回被吞掉的盘符冒号（仅 Windows 盘符形式）
+  if (/^[A-Za-z]\//.test(raw)) raw = raw[0] + ":" + raw.slice(1);
+
+  const normalized = path.normalize(raw);
+  if (fs.existsSync(normalized)) return normalized;
+
+  // 少数情况下是 file:// 绝对路径风格，交给 URL 解析兜底
+  try {
+    const fallback = path.normalize(new URL(originPath).pathname.slice(1));
+    if (fs.existsSync(fallback)) return fallback;
+  } catch { }
+
+  return normalized;
+}
+
+function prepareAppImage(originPath) {
+  if (typeof originPath !== "string" || !originPath.startsWith("appimg://")) return null;
+
+  const sourcePath = appImageToLocalPath(originPath);
+  if (sourcePath == null) return null;
   if (!fs.existsSync(sourcePath)) return null;
   if (path.extname(sourcePath)) return sourcePath;
 
@@ -211,23 +230,29 @@ function onBrowserWindowCreated(window) {
     ) {
       if (hookedWebContents.has(window.webContents)) return;
       hookedWebContents.add(window.webContents);
+      // QQ 的 openMediaViewer 走公开 ipc-message；-ipc-message 为旧版本兼容。
       window.webContents.prependListener("ipc-message", ipc_message);
+      window.webContents.prependListener("-ipc-message", ipc_message);
 
       function ipc_message(event, ...args) {
+        // 两个通道可能收到同一事件，避免重复打开本地查看器
+        const viewerObj = args.flat(Infinity).find(item =>
+          item && typeof item === "object" && item.cmdName === "openMediaViewer"
+        );
+        if (!viewerObj) return;
+        // 已在另一通道处理过同一事件，跳过以免重复打开本地查看器
+        if (viewerObj.__mediaLocalViewHandled) return;
         try {
-          const mediaViewerObj = args.flat(Infinity).find(item =>
-            item &&
-            typeof item === "object" &&
-            item.cmdName === "openMediaViewer"
-          );
-          const mediaViewerData = mediaViewerObj?.payload?.[0];
+          const mediaViewerData = viewerObj?.payload?.[0];
           const mediaList = mediaViewerData?.mediaList;
           const openedPicIndex = mediaViewerData?.index;
           if (!mediaList?.length || openedPicIndex >= mediaList.length) return;
 
           const currentMedia = mediaList[openedPicIndex];
+          // 头像等媒体没有 context.sourcePath，只有 appimg:// 的 originPath。
           const picPath = currentMedia?.context?.sourcePath ||
-            prepareAppImage(currentMedia?.originPath);
+            prepareAppImage(currentMedia?.originPath) ||
+            prepareAppImage(currentMedia?.thumbPath);
           const videoPath = currentMedia?.context?.video?.path;
           var handled = false;
 
@@ -240,9 +265,10 @@ function onBrowserWindowCreated(window) {
           }
 
           if (handled) {
+            viewerObj.__mediaLocalViewHandled = true;
             event.preventDefault();
-            mediaViewerObj.cmdName = "";
-            mediaViewerObj.payload = [];
+            viewerObj.cmdName = "";
+            viewerObj.payload = [];
           }
         } catch (e) {
           output(
